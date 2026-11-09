@@ -1,0 +1,64 @@
+# Production Destroy Pipeline (Requires explicit approval)
+# Configured for Self-Hosted Agent Pools (e.g. 'Default')
+trigger: none
+
+parameters:
+  - name: confirm_destroy
+    displayName: "Type 'DESTROY_PROD' to confirm teardown"
+    type: string
+    default: "CANCEL"
+
+variables:
+  - name: AGENT_POOL
+    value: 'Default' # Name of your self-hosted agent pool
+  - name: TERRAFORM_VERSION
+    value: '1.15.0'
+  - name: SERVICE_CONNECTION
+    value: 'Azure-Service-Connection'
+  - name: STATE_RESOURCE_GROUP
+    value: 'rg-tf-state'
+  - name: STATE_STORAGE_ACCOUNT
+    value: 'tfstateazfree01'
+  - name: STATE_CONTAINER
+    value: 'tfstate'
+
+stages:
+- stage: Destroy_Production
+  displayName: "Destroy Production Infrastructure"
+  condition: eq('${{ parameters.confirm_destroy }}', 'DESTROY_PROD')
+  jobs:
+  - deployment: destroy_prod_job
+    displayName: "Terraform Destroy Prod"
+    environment: 'prod-destroy-approval'
+    pool:
+      name: $(AGENT_POOL)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: $(TERRAFORM_VERSION)
+
+          - task: TerraformTaskV4@4
+            displayName: "Init Backend"
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/prod'
+              backendServiceArm: $(SERVICE_CONNECTION)
+              backendAzureRmResourceGroupName: $(STATE_RESOURCE_GROUP)
+              backendAzureRmStorageAccountName: $(STATE_STORAGE_ACCOUNT)
+              backendAzureRmContainerName: $(STATE_CONTAINER)
+              backendAzureRmKey: 'prod.terraform.tfstate'
+
+          - task: TerraformTaskV4@4
+            displayName: "Destroy Production"
+            inputs:
+              provider: 'azurerm'
+              command: 'destroy'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/prod'
+              environmentServiceNameAzureRM: $(SERVICE_CONNECTION)
+              commandOptions: '-var-file="terraform.tfvars"'

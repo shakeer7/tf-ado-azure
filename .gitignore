@@ -1,0 +1,22 @@
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Executables & Binaries
+opa.exe
+*.exe
+*.binary
+*.plan
+tfplan.json
+kubeconfig
+
+# Logs
+crash.log
+crash.*.log
+*.log
+
+# Sensitive credentials
+*.tfvars.secret
+terraform-full-course-azure

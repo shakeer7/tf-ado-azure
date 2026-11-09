@@ -1,0 +1,170 @@
+# Azure DevOps Production Pipeline with OPA Policy Gate & Manual Approval
+# Configured for Self-Hosted Agent Pools (e.g. 'Default')
+name: Prod_$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - prod/**
+      - modules/**
+      - policy/**
+      - pipelines/**
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  - name: AGENT_POOL
+    value: 'Default' # Change to your self-hosted agent pool name if different
+  - name: TERRAFORM_VERSION
+    value: '1.15.0'
+  - name: SERVICE_CONNECTION
+    value: 'Azure-Service-Connection'
+  - name: STATE_RESOURCE_GROUP
+    value: 'rg-tf-state'
+  - name: STATE_STORAGE_ACCOUNT
+    value: 'tfstateazfree01'
+  - name: STATE_CONTAINER
+    value: 'tfstate'
+
+stages:
+# -------------------------------------------------------------
+# STAGE 1: Code Formatting & Quality
+# -------------------------------------------------------------
+- stage: Validate
+  displayName: "Validate & Format"
+  jobs:
+  - job: validate_job
+    displayName: "Terraform Format Check"
+    pool:
+      name: $(AGENT_POOL)
+    steps:
+    - task: TerraformInstaller@0
+      displayName: "Install Terraform $(TERRAFORM_VERSION)"
+      inputs:
+        terraformVersion: $(TERRAFORM_VERSION)
+
+    - script: |
+        terraform fmt -check -recursive
+      displayName: "Verify Terraform Code Formatting"
+
+# -------------------------------------------------------------
+# STAGE 2: Prod Plan & OPA Policy Evaluation
+# -------------------------------------------------------------
+- stage: Prod_Plan
+  displayName: "Prod Plan & OPA Gate"
+  dependsOn: Validate
+  condition: succeeded()
+  jobs:
+  - job: plan_and_opa
+    displayName: "Terraform Plan & OPA Security Audit"
+    pool:
+      name: $(AGENT_POOL)
+    steps:
+    - checkout: self
+
+    - task: TerraformInstaller@0
+      displayName: "Install Terraform $(TERRAFORM_VERSION)"
+      inputs:
+        terraformVersion: $(TERRAFORM_VERSION)
+
+    - script: |
+        echo "Verifying OPA CLI availability..."
+        if command -v opa &> /dev/null; then
+          opa version
+        elif [ -f "/usr/local/bin/opa" ]; then
+          /usr/local/bin/opa version
+        else
+          echo "Downloading OPA binary for agent..."
+          curl -s -L -o /usr/local/bin/opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static 2>/dev/null || curl -s -L -o opa.exe https://openpolicyagent.org/downloads/latest/opa_windows_amd64.exe
+          chmod 755 /usr/local/bin/opa 2>/dev/null || true
+        fi
+      displayName: "Ensure OPA CLI Available"
+
+    - task: TerraformTaskV4@4
+      displayName: "Terraform Init (Prod)"
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/prod'
+        backendServiceArm: $(SERVICE_CONNECTION)
+        backendAzureRmResourceGroupName: $(STATE_RESOURCE_GROUP)
+        backendAzureRmStorageAccountName: $(STATE_STORAGE_ACCOUNT)
+        backendAzureRmContainerName: $(STATE_CONTAINER)
+        backendAzureRmKey: 'prod.terraform.tfstate'
+
+    - task: TerraformTaskV4@4
+      displayName: "Terraform Plan (Prod)"
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/prod'
+        environmentServiceNameAzureRM: $(SERVICE_CONNECTION)
+        commandOptions: '-var-file="terraform.tfvars" -out=tfplan.binary'
+
+    - script: |
+        cd $(System.DefaultWorkingDirectory)/prod
+        terraform show -json tfplan.binary > tfplan.json
+        echo "Evaluating Production Plan against OPA Policies..."
+        chmod +x ../policy/evaluate-policy.sh 2>/dev/null || true
+        bash ../policy/evaluate-policy.sh tfplan.json ../policy
+      displayName: "OPA Production Policy Gate"
+
+    # Publish plan artifact so apply job can consume it safely
+    - publish: $(System.DefaultWorkingDirectory)/prod/tfplan.binary
+      artifact: prod-tfplan
+      displayName: "Publish Terraform Plan Binary"
+
+# -------------------------------------------------------------
+# STAGE 3: Production Apply (Environment Approval Gate)
+# -------------------------------------------------------------
+- stage: Prod_Apply
+  displayName: "Prod Approval & Apply"
+  dependsOn: Prod_Plan
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: apply_prod
+    displayName: "Apply to Production"
+    environment: 'prod' # Configure Approvals & Checks on this environment in ADO
+    pool:
+      name: $(AGENT_POOL)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: TerraformInstaller@0
+            displayName: "Install Terraform $(TERRAFORM_VERSION)"
+            inputs:
+              terraformVersion: $(TERRAFORM_VERSION)
+
+          - download: current
+            artifact: prod-tfplan
+            displayName: "Download Approved Plan"
+
+          - task: TerraformTaskV4@4
+            displayName: "Terraform Init (Prod)"
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/prod'
+              backendServiceArm: $(SERVICE_CONNECTION)
+              backendAzureRmResourceGroupName: $(STATE_RESOURCE_GROUP)
+              backendAzureRmStorageAccountName: $(STATE_STORAGE_ACCOUNT)
+              backendAzureRmContainerName: $(STATE_CONTAINER)
+              backendAzureRmKey: 'prod.terraform.tfstate'
+
+          - task: TerraformTaskV4@4
+            displayName: "Terraform Apply (Prod)"
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/prod'
+              environmentServiceNameAzureRM: $(SERVICE_CONNECTION)
+              commandOptions: '$(Pipeline.Workspace)/prod-tfplan/tfplan.binary'

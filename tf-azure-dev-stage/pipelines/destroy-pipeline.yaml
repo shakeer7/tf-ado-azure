@@ -1,0 +1,66 @@
+# Azure DevOps Pipeline for Destroying Dev or Staging
+# Configured for Self-Hosted Agent Pools (e.g. 'Default')
+trigger: none
+
+parameters:
+  - name: environment
+    displayName: "Select Environment to Destroy"
+    type: string
+    values:
+      - dev
+      - stage
+    default: dev
+
+variables:
+  - name: AGENT_POOL
+    value: 'Default' # Name of your self-hosted agent pool
+  - name: TERRAFORM_VERSION
+    value: '1.15.0'
+  - name: SERVICE_CONNECTION
+    value: 'Azure-Service-Connection'
+  - name: STATE_RESOURCE_GROUP
+    value: 'rg-tf-state'
+  - name: STATE_STORAGE_ACCOUNT
+    value: 'tfstateazfree01'
+  - name: STATE_CONTAINER
+    value: 'tfstate'
+
+stages:
+- stage: Destroy_Environment
+  displayName: "Destroy ${{ parameters.environment }}"
+  jobs:
+  - deployment: destroy_job
+    displayName: "Terraform Destroy ${{ parameters.environment }}"
+    environment: ${{ parameters.environment }}
+    pool:
+      name: $(AGENT_POOL)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: $(TERRAFORM_VERSION)
+
+          - task: TerraformTaskV4@4
+            displayName: "Init Backend"
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/${{ parameters.environment }}'
+              backendServiceArm: $(SERVICE_CONNECTION)
+              backendAzureRmResourceGroupName: $(STATE_RESOURCE_GROUP)
+              backendAzureRmStorageAccountName: $(STATE_STORAGE_ACCOUNT)
+              backendAzureRmContainerName: $(STATE_CONTAINER)
+              backendAzureRmKey: '${{ parameters.environment }}.terraform.tfstate'
+
+          - task: TerraformTaskV4@4
+            displayName: "Destroy Infrastructure"
+            inputs:
+              provider: 'azurerm'
+              command: 'destroy'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/${{ parameters.environment }}'
+              environmentServiceNameAzureRM: $(SERVICE_CONNECTION)
+              commandOptions: '-var-file="terraform.tfvars"'
